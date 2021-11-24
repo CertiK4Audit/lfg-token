@@ -53,6 +53,9 @@ contract GamersePool is Ownable, ReentrancyGuard {
     // Penalty Fee
     uint256 public penaltyFee;
 
+    // The withdraw lock duration
+    uint256 public withdrawLock;
+
     // Penalty Duration
     uint256 public penaltyDuration;
 
@@ -64,12 +67,19 @@ contract GamersePool is Ownable, ReentrancyGuard {
 
     // Info of each user that stakes tokens (stakedToken)
     mapping(address => UserInfo) public userInfo;
+    mapping(address => uint128) private visited;
+
+    struct Stake {
+        uint256 stakeAmount;
+        uint256 timestampSec;
+    }
 
     struct UserInfo {
         uint256 amount; // How many staked tokens the user has provided
         uint256 rewardDebt; // Reward debt
         uint256 nextWithdrawalUntil; // When can the user withdraw again.
         uint256 penaltyUntil; //When can the user withdraw without penalty
+        Stake[] stakes; // stakes array for locking funds
     }
 
     event AdminTokenRecovery(address tokenRecovered, uint256 amount);
@@ -79,6 +89,7 @@ contract GamersePool is Ownable, ReentrancyGuard {
     event NewRewardPerBlock(uint256 rewardPerBlock);
     event RewardsStop(uint256 blockNumber);
     event Withdraw(address indexed user, uint256 amount);
+    event NewWithdrawLock(uint256 amount);
     event NewWithdrawalInterval(uint256 interval);
     event NewPenaltyFee(uint256 fee);
     event NewPenaltyDuration(uint256 fee);
@@ -91,6 +102,7 @@ contract GamersePool is Ownable, ReentrancyGuard {
         uint256 _startBlock,
         uint256 _bonusEndBlock,
         uint256 _withdrawalInterval,
+        uint256 _withdrawLock,
         uint256 _penaltyFee,
         uint256 _penaltyDuration
     ) public {
@@ -104,6 +116,7 @@ contract GamersePool is Ownable, ReentrancyGuard {
         startBlock = _startBlock;
         bonusEndBlock = _bonusEndBlock;
         withdrawalInterval = _withdrawalInterval;
+        withdrawLock = _withdrawLock;
         penaltyFee = _penaltyFee;
         penaltyDuration = _penaltyDuration;
         rewardHolder = _rewardHolder;
@@ -139,6 +152,7 @@ contract GamersePool is Ownable, ReentrancyGuard {
         if (_amount != 0) {
             stakedToken.safeTransferFrom(address(msg.sender), address(this), _amount);
             user.amount = user.amount.add(_amount);
+            user.stakes.push(Stake(_amount, block.timestamp.add(withdrawLock)));
 
             if (user.nextWithdrawalUntil == 0) {
                 user.nextWithdrawalUntil = block.timestamp.add(withdrawalInterval);
@@ -167,8 +181,12 @@ contract GamersePool is Ownable, ReentrancyGuard {
         );
 
         if (_amount != 0) {
-            user.amount = user.amount.sub(_amount);
-            stakedToken.safeTransfer(address(msg.sender), _amount);
+            uint256 unlocked = _checkRedeemable(msg.sender, _amount);
+
+            if (unlocked != 0) {
+                user.amount = user.amount.sub(unlocked);
+                stakedToken.safeTransfer(address(msg.sender), unlocked);
+            }
         }
 
         if (pending != 0) {
@@ -189,6 +207,76 @@ contract GamersePool is Ownable, ReentrancyGuard {
         user.rewardDebt = user.amount.mul(accTokenPerShare).div(PRECISION_FACTOR);
 
         emit Withdraw(msg.sender, _amount);
+    }
+
+    // Get the unlocked amount.
+    function redeemableAmount(address _user) external view returns (uint256) {
+        uint256 sum;
+        if (block.number >= bonusEndBlock) {
+            sum = userInfo[_user].amount;
+        } else {
+            for (
+                uint128 i = visited[_user];
+                i < userInfo[_user].stakes.length &&
+                    userInfo[_user].stakes[i].timestampSec <= block.timestamp;
+                i++
+            ) {
+                sum += userInfo[_user].stakes[i].stakeAmount;
+            }
+        }
+        return sum;
+    }
+
+    function _checkRedeemable(address _sender, uint256 _amount) internal returns (uint256) {
+        require(
+            userInfo[_sender].stakes[0].timestampSec > 0,
+            "Your first deposit is not redeemable yet"
+        );
+
+        uint256 sum;
+        uint256 penaltyAmount;
+
+        if (block.number >= bonusEndBlock) {
+            for (uint128 i = visited[_sender]; i < userInfo[_sender].stakes.length; i++) {
+                sum += userInfo[_sender].stakes[i].stakeAmount;
+                if (sum == _amount) {
+                    visited[_sender] = i + 1;
+                    break;
+                } else if (sum > _amount) {
+                    visited[_sender] = i;
+                    userInfo[_sender].stakes[i].stakeAmount = sum.sub(_amount);
+                    break;
+                }
+            }
+        } else {
+            for (uint128 i = visited[_sender]; i < userInfo[_sender].stakes.length; i++) {
+                sum += userInfo[_sender].stakes[i].stakeAmount;
+                if (sum == _amount) {
+                    visited[_sender] = i + 1;
+
+                    if (block.timestamp < userInfo[_sender].stakes[i].timestampSec)
+                        penaltyAmount = penaltyAmount.add(userInfo[_sender].stakes[i].stakeAmount);
+
+                    break;
+                } else if (sum > _amount) {
+                    visited[_sender] = i;
+                    if (block.timestamp < userInfo[_sender].stakes[i].timestampSec) {
+                        penaltyAmount = penaltyAmount
+                            .add(userInfo[_sender].stakes[i].stakeAmount)
+                            .sub(sum)
+                            .add(_amount);
+                    }
+                    userInfo[_sender].stakes[i].stakeAmount = sum.sub(_amount);
+
+                    break;
+                }
+
+                if (block.timestamp < userInfo[_sender].stakes[i].timestampSec)
+                    penaltyAmount = penaltyAmount.add(userInfo[_sender].stakes[i].stakeAmount);
+            }
+        }
+
+        return penaltyAmount;
     }
 
     /*
@@ -233,6 +321,7 @@ contract GamersePool is Ownable, ReentrancyGuard {
      */
     function stopReward() external onlyOwner {
         bonusEndBlock = block.number;
+        emit RewardsStop(block.number);
     }
 
     /*
@@ -289,6 +378,16 @@ contract GamersePool is Ownable, ReentrancyGuard {
         require(_fee <= MAXIMUM_PENALTY_FEE, "Invalid penalty fee");
         penaltyFee = _fee;
         emit NewPenaltyFee(_fee);
+    }
+
+    /*
+     * @notice Update the withdraw lock value
+     * @dev Only callable by owner.
+     * @param _withdrawLock: the withdrawLock value
+     */
+    function updateWithdrawLock(uint256 _withdrawLock) external onlyOwner {
+        withdrawLock = _withdrawLock;
+        emit NewWithdrawLock(withdrawLock);
     }
 
     /*
